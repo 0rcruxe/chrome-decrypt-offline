@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Chrome credential/cookie info and decryption tool."""
+"""Chrome credential/cookie/webdata info and decryption tool."""
 
 import argparse
 import base64
@@ -45,7 +45,7 @@ def get_encryption_version(encrypted_value: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Table rendering (rich → tabulate → manual fallback)
+# Table rendering (rich -> tabulate -> manual fallback)
 # ---------------------------------------------------------------------------
 
 def print_table(headers: list, rows: list, title: str = "") -> None:
@@ -62,7 +62,6 @@ def print_table(headers: list, rows: list, title: str = "") -> None:
         print(f"\n{title}")
     print(tabulate(rows, headers=headers))
     return
-
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +118,6 @@ def _prompt_text(label: str, key: str, formdata: dict, completions: list | None 
             return matches[state] if state < len(matches) else None
         readline.set_completer(_completer)
     else:
-        # Filesystem path completion as default
         def _completer(text, state):
             matches = glob.glob(text + "*")
             return matches[state] if state < len(matches) else None
@@ -144,7 +142,7 @@ def _prompt_text(label: str, key: str, formdata: dict, completions: list | None 
 def _prompt_secret(label: str, key: str, formdata: dict) -> str:
     """Prompt for a secret value; cached value shown as hint, not pre-filled."""
     cached = formdata.get(key, "")
-    hint = " [cached — press Enter to reuse]" if cached else ""
+    hint = " [cached - press Enter to reuse]" if cached else ""
     value = getpass.getpass(f"{label}{hint}: ")
     value = value or cached
     if value:
@@ -173,7 +171,7 @@ class ChromeDecryptor:
         self.verbose = verbose
         self.browserkey_v10: bytes | None = None
         self.browserkey_v20: bytes | None = None
-        self._user_masterkey: bytes | None = None  # raw dpapick3 masterkey bytes, kept for v20
+        self._user_masterkey_v10: bytes | None = None  # masterkey for encrypted_key (v10)
         self._v20_key_attempted: bool = False
 
     def _log(self, msg: str) -> None:
@@ -181,11 +179,11 @@ class ChromeDecryptor:
             print(msg)
 
     # ------------------------------------------------------------------
-    # Key loading
+    # Key loading - v10
     # ------------------------------------------------------------------
 
     def load_key_from_localstate(self) -> None:
-        """Parse the DPAPI-wrapped AES key from Local State and decrypt it."""
+        """Parse the DPAPI-wrapped AES key from Local State and decrypt it (v10)."""
         if not self.localstate_path:
             raise ValueError("--localstate is required for --decrypt")
 
@@ -204,14 +202,14 @@ class ChromeDecryptor:
 
         dpapi_blob = dpapi_blob_mod.DPAPIBlob(raw_blob)
         mk_guid = str(dpapi_blob.mkguid)
-        self._log(f"[*] DPAPI masterkey GUID: {mk_guid}")
+        self._log(f"[*] v10 DPAPI masterkey GUID required: {mk_guid}")
 
         entries = _load_formdata()
         formdata = _get_state_cache(entries, self.localstate_path)
 
         mk_path = _prompt_text(
-            f"  Masterkey file (GUID={mk_guid})",
-            "mk_path",
+            f"  Masterkey file for v10 (GUID={mk_guid})",
+            "mk_path_v10",
             formdata,
         )
         sid = _prompt_text(
@@ -224,33 +222,27 @@ class ChromeDecryptor:
 
         _save_formdata(entries)
 
-        # Decrypt the masterkey file
         with open(mk_path, "rb") as _f:
             mkf = dpapi_mk_mod.MasterKeyFile(_f.read())
         mkf.decryptWithPassword(sid, password)
         if not mkf.decrypted:
-            raise ValueError("Failed to decrypt masterkey — wrong SID or password?")
+            raise ValueError("Failed to decrypt v10 masterkey - wrong SID or password?")
 
-        # Unprotect the DPAPI blob with the raw masterkey bytes
-        self._user_masterkey = mkf.get_key()
-        dpapi_blob.decrypt(self._user_masterkey)
+        self._user_masterkey_v10 = mkf.get_key()
+        dpapi_blob.decrypt(self._user_masterkey_v10)
         if not dpapi_blob.decrypted:
-            raise ValueError("DPAPI blob decryption failed")
+            raise ValueError("DPAPI blob decryption failed (v10)")
 
         self.browserkey_v10 = dpapi_blob.cleartext
         self._log(f"[+] v10 browser key loaded ({len(self.browserkey_v10)} bytes)")
 
     # ------------------------------------------------------------------
-    # v20 App-Bound key loading
+    # Key loading - v20 App-Bound
     # ------------------------------------------------------------------
 
     def load_v20_key(self) -> None:
         """Derive the v20 browser key from SYSTEM DPAPI + KSP + app_bound_encrypted_key."""
-        if self._user_masterkey is None:
-            raise ValueError("User masterkey not loaded — call load_key_from_localstate() first")
 
-
-        # Pre-parse app_bound_encrypted_key to extract the SYSTEM masterkey GUID for the prompt
         with open(self.localstate_path, "r", encoding="utf-8") as _f:
             state = json.load(_f)
         app_bound_b64 = state.get("os_crypt", {}).get("app_bound_encrypted_key")
@@ -263,10 +255,10 @@ class ChromeDecryptor:
 
         entries = _load_formdata()
         formdata = _get_state_cache(entries, self.localstate_path)
-        print("\n[*] v20 App-Bound encryption detected — SYSTEM DPAPI inputs required")  # always: precedes prompts
+        print("\n[*] v20 App-Bound encryption detected - SYSTEM DPAPI inputs required")
 
         system_userkey_input = _prompt_text(
-            "  SYSTEM DPAPI userkey (file path or hex bytes)",
+            "  SYSTEM DPAPI userkey (file path or hex bytes, from secretsdump)",
             "system_userkey",
             formdata,
         )
@@ -292,7 +284,7 @@ class ChromeDecryptor:
         system_masterkey = sys_mkf.get_key()
         self._log("[+] SYSTEM masterkey decrypted")
 
-        # 2. Decrypt KSP key blob
+        # 2. Decrypt KSP key blob (Google Chromekey1)
         ksp_raw = Path(ksp_key_path).read_bytes()
         DPAPI_MAGIC = bytes([0x01, 0x00, 0x00, 0x00, 0xD0, 0x8C, 0x9D, 0xDF])
         boffset = ksp_raw[::-1].index(DPAPI_MAGIC[::-1]) + len(DPAPI_MAGIC)
@@ -309,14 +301,38 @@ class ChromeDecryptor:
             ksp_key = ksp_raw_key[:32]
         self._log(f"[+] KSP key decrypted ({len(ksp_key)} bytes, from {len(ksp_raw_key)}-byte blob)")
 
-        # 4. Decrypt blob1 (SYSTEM key), then blob2 (user key)
+        # 3. Decrypt blob1 (SYSTEM key) -> reveals blob2
         blob1 = dpapi_blob_mod.DPAPIBlob(app_bound_raw[4:])
         blob1.decrypt(system_masterkey)
         if not blob1.decrypted:
             raise ValueError("Failed to decrypt app_bound blob1 with SYSTEM DPAPI key")
 
+
+        blob2_probe = dpapi_blob_mod.DPAPIBlob(blob1.cleartext)
+        needed_guid = str(blob2_probe.mkguid)
+        self._log(f"[*] blob2 requires user masterkey GUID: {needed_guid}")
+
+        sid2 = _prompt_text(
+            "  User SID (for blob2's masterkey)",
+            "sid",
+            formdata,
+        )
+        mk2_path = _prompt_text(
+            f"  Masterkey file for blob2 (GUID={needed_guid})",
+            "mk2_path",
+            formdata,
+        )
+        password2 = _prompt_secret("  Password (for blob2's masterkey)", "password", formdata)
+        _save_formdata(entries)
+
+        with open(mk2_path, "rb") as _f:
+            mkf2 = dpapi_mk_mod.MasterKeyFile(_f.read())
+        mkf2.decryptWithPassword(sid2, password2)
+        if not mkf2.decrypted:
+            raise ValueError("Failed to decrypt blob2's user masterkey - wrong SID or password?")
+
         blob2 = dpapi_blob_mod.DPAPIBlob(blob1.cleartext)
-        blob2.decrypt(self._user_masterkey)
+        blob2.decrypt(mkf2.get_key())
         if not blob2.decrypted:
             raise ValueError("Failed to decrypt app_bound blob2 with user DPAPI key")
 
@@ -337,9 +353,9 @@ class ChromeDecryptor:
 
         if flag in (1, 2):
             # flag(1b) | IV(12b) | TAG(16b) | ciphertext
-            iv  = content[1:13]
+            iv = content[1:13]
             tag = content[13:29]
-            ct  = content[29:]
+            ct = content[29:]
             if flag == 1:
                 key = bytes.fromhex(
                     "B31C6E241AC846728DA9C1FAC4936651"
@@ -356,9 +372,9 @@ class ChromeDecryptor:
         if flag == 3:
             # flag(1b) | encrypted_aes_key(32b) | IV(12b) | ciphertext(32b) | TAG(16b)
             enc_key = content[1:33]
-            iv      = content[33:45]
-            ct      = content[45:77]
-            tag     = content[77:93]
+            iv = content[33:45]
+            ct = content[45:77]
+            tag = content[77:93]
             xor_key = bytes.fromhex(
                 "CCF8A1CEC56605B8517552BA1A2D061C"
                 "03A29E90274FB2FCF59BA4B75C392390"
@@ -418,7 +434,7 @@ class ChromeDecryptor:
         return plaintext.decode("utf-8", errors="replace")
 
     # ------------------------------------------------------------------
-    # Decryption queries
+    # Decryption queries - Login Data / Cookies
     # ------------------------------------------------------------------
 
     def decrypt_logindata(self, path: str) -> None:
@@ -473,6 +489,66 @@ class ChromeDecryptor:
             conn.close()
             os.unlink(tmp)
 
+    # ------------------------------------------------------------------
+    # Decryption queries - Web Data (credit cards, CVC, IBANs)
+    # ------------------------------------------------------------------
+
+    def decrypt_webdata(self, path: str) -> None:
+        conn, tmp = open_sqlite_copy(path)
+        try:
+            cur = conn.cursor()
+
+            # -- Credit cards --
+            cur.execute(
+                "SELECT name_on_card, expiration_month, expiration_year, "
+                "card_number_encrypted, nickname FROM credit_cards"
+            )
+            rows = []
+            for name, exp_m, exp_y, enc_num, nickname in cur.fetchall():
+                if isinstance(enc_num, str):
+                    enc_num = enc_num.encode()
+                rows.append((
+                    name or "",
+                    f"{exp_m or ''}/{exp_y or ''}",
+                    nickname or "",
+                    self.decrypt_value(enc_num) if enc_num else "",
+                ))
+            print_table(
+                ["Name on card", "Expiration", "Nickname", "Card number"],
+                rows,
+                title="Credit Cards (decrypted)",
+            )
+
+            # -- Stored CVC (opt-in feature, table absent on older Chrome) --
+            try:
+                cur.execute("SELECT guid, value_encrypted FROM local_stored_cvc")
+                cvc_rows = []
+                for guid, enc_cvc in cur.fetchall():
+                    if isinstance(enc_cvc, str):
+                        enc_cvc = enc_cvc.encode()
+                    cvc_rows.append((guid, self.decrypt_value(enc_cvc) if enc_cvc else ""))
+                if cvc_rows:
+                    print_table(["Card GUID", "CVC"], cvc_rows, title="Stored CVC (decrypted)")
+            except sqlite3.OperationalError:
+                pass
+
+            # -- IBANs --
+            try:
+                cur.execute("SELECT nickname, value_encrypted FROM local_ibans")
+                iban_rows = []
+                for nickname, enc_iban in cur.fetchall():
+                    if isinstance(enc_iban, str):
+                        enc_iban = enc_iban.encode()
+                    iban_rows.append((nickname or "", self.decrypt_value(enc_iban) if enc_iban else ""))
+                if iban_rows:
+                    print_table(["Nickname", "IBAN"], iban_rows, title="IBANs (decrypted)")
+            except sqlite3.OperationalError:
+                pass
+
+        finally:
+            conn.close()
+            os.unlink(tmp)
+
 
 # ---------------------------------------------------------------------------
 # --info command (read-only, no decryption)
@@ -514,6 +590,50 @@ def info_cookies(path: str) -> None:
         os.unlink(tmp)
 
 
+def info_webdata(path: str) -> None:
+    conn, tmp = open_sqlite_copy(path)
+    try:
+        cur = conn.cursor()
+
+        # Numéros de carte
+        cur.execute("SELECT name_on_card, card_number_encrypted FROM credit_cards")
+        rows = []
+        for name, enc_num in cur.fetchall():
+            if isinstance(enc_num, str):
+                enc_num = enc_num.encode()
+            rows.append((name or "", get_encryption_version(enc_num)))
+        print_table(["Name on card", "Encryption"], rows, title="Web Data — Credit Cards")
+
+        # CVC enregistrés (table absente sur les anciennes versions de Chrome)
+        try:
+            cur.execute("SELECT guid, value_encrypted FROM local_stored_cvc")
+            cvc_rows = []
+            for guid, enc_cvc in cur.fetchall():
+                if isinstance(enc_cvc, str):
+                    enc_cvc = enc_cvc.encode()
+                cvc_rows.append((guid, get_encryption_version(enc_cvc)))
+            if cvc_rows:
+                print_table(["Card GUID", "Encryption"], cvc_rows, title="Web Data — Stored CVC")
+        except sqlite3.OperationalError:
+            pass
+
+        # IBANs
+        try:
+            cur.execute("SELECT nickname, value_encrypted FROM local_ibans")
+            iban_rows = []
+            for nickname, enc_iban in cur.fetchall():
+                if isinstance(enc_iban, str):
+                    enc_iban = enc_iban.encode()
+                iban_rows.append((nickname or "", get_encryption_version(enc_iban)))
+            if iban_rows:
+                print_table(["Nickname", "Encryption"], iban_rows, title="Web Data — IBANs")
+        except sqlite3.OperationalError:
+            pass
+
+    finally:
+        conn.close()
+        os.unlink(tmp)
+
 def info_localstate(path: str) -> None:
     with open(path, "r", encoding="utf-8") as f:
         state = json.load(f)
@@ -532,19 +652,21 @@ def info_localstate(path: str) -> None:
         rows.append(("os_crypt.app_bound_encrypted_key", "App-Bound AES key", app_bound_key))
 
     if rows:
-        print_table(["Field", "Type", "Value (base64)"], rows, title="Local State — Encryption Keys")
+        print_table(["Field", "Type", "Value (base64)"], rows, title="Local State - Encryption Keys")
     else:
         print("No encrypted key material found in Local State.")
 
 
 def cmd_info(args: argparse.Namespace) -> None:
-    if not any([args.logindata, args.cookies, args.localstate]):
-        print("--info requires at least one of --logindata, --cookies, --localstate.")
+    if not any([args.logindata, args.cookies, args.localstate, args.webdata]):
+        print("--info requires at least one of --logindata, --cookies, --localstate, --webdata.")
         sys.exit(1)
     if args.logindata:
         info_logindata(args.logindata)
     if args.cookies:
         info_cookies(args.cookies)
+    if args.webdata:
+        info_webdata(args.webdata)
     if args.localstate:
         info_localstate(args.localstate)
 
@@ -557,8 +679,8 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
     if not args.localstate:
         print("--decrypt requires --localstate (needed to load the browser AES key).")
         sys.exit(1)
-    if not args.logindata and not args.cookies:
-        print("--decrypt requires --logindata and/or --cookies.")
+    if not args.logindata and not args.cookies and not args.webdata:
+        print("--decrypt requires --logindata, --cookies, and/or --webdata.")
         sys.exit(1)
 
     decryptor = ChromeDecryptor(localstate_path=args.localstate, verbose=args.verbose)
@@ -568,6 +690,16 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
         decryptor.decrypt_logindata(args.logindata)
     if args.cookies:
         decryptor.decrypt_cookies(args.cookies)
+    if args.webdata:
+        decryptor.decrypt_webdata(args.webdata)
+
+    print()
+    if decryptor.browserkey_v10:
+        print(f"[+] browser_key_v10 (hex, {len(decryptor.browserkey_v10)} bytes): "
+              f"{decryptor.browserkey_v10.hex()}")
+    if decryptor.browserkey_v20:
+        print(f"[+] browser_key_v20 (hex, {len(decryptor.browserkey_v20)} bytes): "
+              f"{decryptor.browserkey_v20.hex()}")
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +709,7 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chrome-decrypt",
-        description="Inspect and decrypt Chrome credentials, cookies, and keys.",
+        description="Inspect and decrypt Chrome credentials, cookies, web data, and keys.",
     )
     parser.add_argument(
         "-l", "--logindata",
@@ -595,6 +727,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to Chrome Cookies SQLite file",
     )
     parser.add_argument(
+        "-w", "--webdata",
+        metavar="PATH",
+        help='Path to Chrome "Web Data" SQLite file (credit cards, CVC, IBANs)',
+    )
+    parser.add_argument(
         "--info",
         action="store_true",
         help="Show encryption metadata (versions, key material) without decrypting",
@@ -603,9 +740,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--decrypt",
         action="store_true",
         help=(
-            "Decrypt passwords/cookies. "
-            "Requires --localstate AND (--logindata and/or --cookies). "
-            "Prompts for DPAPI masterkey path, SID, and password; caches to .formdata.json"
+            "Decrypt passwords/cookies/webdata. "
+            "Requires --localstate AND (--logindata and/or --cookies and/or --webdata). "
+            "Prompts for DPAPI masterkey paths, SID, and password; caches to .formdata.json. "
+            "Prints the derived browser_key_v10/v20 in hex at the end."
         ),
     )
     parser.add_argument(
